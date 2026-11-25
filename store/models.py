@@ -33,6 +33,7 @@ class Product(models.Model):
         MEN = "MEN", "02 — MEN"
         COLLECTIONS = "COLLECTIONS", "03 — COLLECTIONS"
         NEW_ARRIVALS = "NEW_ARRIVALS", "04 — NEW ARRIVALS"
+        FOOTWEAR = "FOOTWEAR", "05 — FOOTWEAR"
 
     collection = models.ForeignKey(
         Collection,
@@ -252,13 +253,16 @@ class Look(models.Model):
 class LookPiece(models.Model):
     class RoleChoices(models.TextChoices):
         TOP = "TOP", "HAUT"
+        OUTERWEAR = "OUTERWEAR", "OUTERWEAR / VESTE"
         BOTTOM = "BOTTOM", "BAS"
         FOOTWEAR_ACC = "FOOTWEAR / ACC", "CHAUSSURES / ACCESSOIRE"
+        SAC = "SAC", "SAC / MAROQUINERIE"
+        ACCESSOIRE = "ACCESSOIRE", "ACCESSOIRE"
+        BIJOU_COIFFE = "BIJOU / COIFFE", "BIJOU / COIFFE"
 
     look = models.ForeignKey(Look, related_name="pieces", on_delete=models.CASCADE)
     role = models.CharField(
         max_length=40,
-        choices=RoleChoices.choices,
         default=RoleChoices.TOP,
     )
     product = models.ForeignKey(
