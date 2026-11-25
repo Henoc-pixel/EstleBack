@@ -240,3 +240,55 @@ class AdminPaymentToggleSchema(BaseModel):
     is_active: bool
     badge_label: Optional[str] = None
     instructions: Optional[str] = None
+
+
+class LookPieceOutSchema(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    role: str
+    product_id: Optional[int] = None
+    product_slug: Optional[str] = None
+    name: str
+    price_fcfa: int
+    image: str
+    product: Optional[ProductSchema] = None
+
+
+class LookOutSchema(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    index: int
+    code: str
+    title: str
+    season: str
+    silhouette_image: str
+    styling_notes: str
+    coordinates: str
+    display_order: int
+    is_active: bool
+    pieces: List[LookPieceOutSchema] = []
+
+
+class AdminLookPieceWriteSchema(BaseModel):
+    id: Optional[int] = None
+    role: str = "TOP"
+    product_id: Optional[int] = None
+    fallback_name: str = ""
+    fallback_price_fcfa: int = 0
+    fallback_image: str = ""
+    order: int = 0
+
+
+class AdminLookWriteSchema(BaseModel):
+    code: str = "LOOK 01"
+    title: str
+    season: str = "AW26 • ABIDJAN STUDIO"
+    silhouette_image: str
+    styling_notes: str = ""
+    coordinates: str = "5.3599° N • 4.0083° W"
+    display_order: int = 0
+    is_active: bool = True
+    pieces: List[AdminLookPieceWriteSchema] = []
+

@@ -17,9 +17,12 @@ from .models import (
     ProductImage,
     ProductVariant,
     SiteContent,
+    Look,
+    LookPiece,
 )
 from .schemas import (
     AdminCollectionWriteSchema,
+    AdminLookWriteSchema,
     AdminOrderStatusPatchSchema,
     AdminPaymentToggleSchema,
     AdminProductWriteSchema,
@@ -27,6 +30,7 @@ from .schemas import (
     AdminVariantStockPatchSchema,
     CollectionDetailSchema,
     CollectionSchema,
+    LookOutSchema,
     OrderCreateSchema,
     OrderOutSchema,
     PaymentMethodConfigSchema,
@@ -113,6 +117,43 @@ async def _serialize_order(order: Order) -> dict:
         "created_at": order.created_at,
         "items": items,
     }
+
+
+async def _serialize_look(look: Look, index: int) -> dict:
+    pieces_qs = LookPiece.objects.filter(look_id=look.id).select_related("product", "product__collection").order_by("order", "id")
+    pieces_data = []
+    async for p in pieces_qs:
+        prod = p.product
+        prod_data = await _serialize_product(prod) if prod else None
+        display_name = prod.name if prod else (p.fallback_name or "Pièce ESTLE")
+        display_price = prod.price_fcfa if prod else p.fallback_price_fcfa
+        display_img = prod_data["primary_image"] if prod_data else (p.fallback_image or "")
+
+        pieces_data.append({
+            "id": p.id,
+            "role": p.role,
+            "product_id": prod.id if prod else None,
+            "product_slug": prod.slug if prod else None,
+            "name": display_name,
+            "price_fcfa": display_price,
+            "image": display_img,
+            "product": prod_data,
+        })
+
+    return {
+        "id": look.id,
+        "index": index,
+        "code": look.code,
+        "title": look.title,
+        "season": look.season,
+        "silhouette_image": look.silhouette_image,
+        "styling_notes": look.styling_notes,
+        "coordinates": look.coordinates,
+        "display_order": look.display_order,
+        "is_active": look.is_active,
+        "pieces": pieces_data,
+    }
+
 
 
 def _calculate_shipping_fcfa(zone_type: str, city: str, commune: str, subtotal: int) -> int:
@@ -671,3 +712,109 @@ async def admin_toggle_payment_method(request, code: str, data: AdminPaymentTogg
         pm.instructions = data.instructions
     await pm.asave()
     return pm
+
+
+# ============================================================================
+# 5. LOOKS ÉDITORIAUX & SILHOUETTES "TRY THE LOOK" (PUBLIC & ADMIN)
+# ============================================================================
+
+@router.get("/looks", response=List[LookOutSchema])
+async def list_looks(request):
+    looks = [l async for l in Look.objects.filter(is_active=True).order_by("display_order", "id")]
+    result = []
+    for idx, look in enumerate(looks):
+        result.append(await _serialize_look(look, idx))
+    return result
+
+
+@router.get("/admin/looks", response=List[LookOutSchema], auth=AsyncAdminAuthBearer())
+async def list_admin_looks(request):
+    looks = [l async for l in Look.objects.all().order_by("display_order", "id")]
+    result = []
+    for idx, look in enumerate(looks):
+        result.append(await _serialize_look(look, idx))
+    return result
+
+
+@router.post("/admin/looks", response={201: LookOutSchema}, auth=AsyncAdminAuthBearer())
+async def create_look(request, payload: AdminLookWriteSchema):
+    @sync_to_async
+    def _create():
+        with transaction.atomic():
+            look = Look.objects.create(
+                code=payload.code,
+                title=payload.title,
+                season=payload.season,
+                silhouette_image=payload.silhouette_image,
+                styling_notes=payload.styling_notes,
+                coordinates=payload.coordinates,
+                display_order=payload.display_order,
+                is_active=payload.is_active,
+            )
+            for idx, piece_data in enumerate(payload.pieces):
+                LookPiece.objects.create(
+                    look=look,
+                    role=piece_data.role,
+                    product_id=piece_data.product_id,
+                    fallback_name=piece_data.fallback_name,
+                    fallback_price_fcfa=piece_data.fallback_price_fcfa,
+                    fallback_image=piece_data.fallback_image,
+                    order=piece_data.order or idx,
+                )
+            return look
+
+    look = await _create()
+    count = await Look.objects.filter(id__lt=look.id, is_active=True).acount()
+    data = await _serialize_look(look, count)
+    return 201, data
+
+
+@router.put("/admin/looks/{look_id}", response=LookOutSchema, auth=AsyncAdminAuthBearer())
+async def update_look(request, look_id: int, payload: AdminLookWriteSchema):
+    @sync_to_async
+    def _update():
+        with transaction.atomic():
+            try:
+                look = Look.objects.get(id=look_id)
+            except Look.DoesNotExist:
+                raise HttpError(404, "Look introuvable")
+            look.code = payload.code
+            look.title = payload.title
+            look.season = payload.season
+            look.silhouette_image = payload.silhouette_image
+            look.styling_notes = payload.styling_notes
+            look.coordinates = payload.coordinates
+            look.display_order = payload.display_order
+            look.is_active = payload.is_active
+            look.save()
+
+            if payload.pieces is not None:
+                look.pieces.all().delete()
+                for idx, piece_data in enumerate(payload.pieces):
+                    LookPiece.objects.create(
+                        look=look,
+                        role=piece_data.role,
+                        product_id=piece_data.product_id,
+                        fallback_name=piece_data.fallback_name,
+                        fallback_price_fcfa=piece_data.fallback_price_fcfa,
+                        fallback_image=piece_data.fallback_image,
+                        order=piece_data.order or idx,
+                    )
+            return look
+
+    look = await _update()
+    count = await Look.objects.filter(id__lt=look.id, is_active=True).acount()
+    return await _serialize_look(look, count)
+
+
+@router.delete("/admin/looks/{look_id}", response=dict, auth=AsyncAdminAuthBearer())
+async def delete_look(request, look_id: int):
+    @sync_to_async
+    def _delete():
+        deleted, _ = Look.objects.filter(id=look_id).delete()
+        if not deleted:
+            raise HttpError(404, "Look introuvable")
+        return {"success": True, "message": "Look supprimé avec succès"}
+
+    return await _delete()
+

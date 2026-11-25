@@ -226,3 +226,59 @@ class OrderItem(models.Model):
 
     def __str__(self):
         return f"{self.quantity}x {self.product_name} ({self.size} / {self.color_name})"
+
+
+class Look(models.Model):
+    code = models.CharField(max_length=50, default="LOOK 01", db_index=True)
+    title = models.CharField(max_length=200)
+    season = models.CharField(max_length=150, default="AW26 • ABIDJAN STUDIO")
+    silhouette_image = models.URLField(max_length=600)
+    styling_notes = models.TextField(blank=True)
+    coordinates = models.CharField(max_length=150, default="5.3599° N • 4.0083° W")
+    display_order = models.PositiveIntegerField(default=0, db_index=True)
+    is_active = models.BooleanField(default=True, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Look Éditorial"
+        verbose_name_plural = "Looks Éditoriaux"
+        ordering = ["display_order", "id"]
+
+    def __str__(self):
+        return f"{self.code} — {self.title}"
+
+
+class LookPiece(models.Model):
+    class RoleChoices(models.TextChoices):
+        TOP = "TOP", "HAUT"
+        BOTTOM = "BOTTOM", "BAS"
+        FOOTWEAR_ACC = "FOOTWEAR / ACC", "CHAUSSURES / ACCESSOIRE"
+
+    look = models.ForeignKey(Look, related_name="pieces", on_delete=models.CASCADE)
+    role = models.CharField(
+        max_length=40,
+        choices=RoleChoices.choices,
+        default=RoleChoices.TOP,
+    )
+    product = models.ForeignKey(
+        Product,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="look_appearances",
+    )
+    fallback_name = models.CharField(max_length=200, blank=True)
+    fallback_price_fcfa = models.PositiveIntegerField(default=0)
+    fallback_image = models.URLField(max_length=600, blank=True)
+    order = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        verbose_name = "Pièce de Look"
+        verbose_name_plural = "Pièces de Look"
+        ordering = ["order", "id"]
+
+    def __str__(self):
+        name = self.product.name if self.product else self.fallback_name
+        return f"[{self.role}] {name} ({self.look.code})"
+

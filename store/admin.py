@@ -8,6 +8,8 @@ from .models import (
     ProductImage,
     ProductVariant,
     SiteContent,
+    Look,
+    LookPiece,
 )
 
 
@@ -67,3 +69,32 @@ class PaymentMethodConfigAdmin(admin.ModelAdmin):
 @admin.register(SiteContent)
 class SiteContentAdmin(admin.ModelAdmin):
     list_display = ("key", "title", "subtitle", "updated_at")
+
+
+class LookPieceInline(admin.TabularInline):
+    model = LookPiece
+    extra = 3
+    fields = ("order", "role", "product", "fallback_name", "fallback_price_fcfa", "fallback_image")
+    autocomplete_fields = ["product"]
+
+
+@admin.register(Look)
+class LookAdmin(admin.ModelAdmin):
+    list_display = ("code", "title", "season", "display_order", "is_active", "get_pieces_count", "created_at")
+    list_editable = ("display_order", "is_active")
+    list_filter = ("is_active", "season")
+    search_fields = ("code", "title", "season", "styling_notes", "coordinates")
+    inlines = [LookPieceInline]
+
+    @admin.display(description="Pièces associées")
+    def get_pieces_count(self, obj):
+        return obj.pieces.count()
+
+
+@admin.register(LookPiece)
+class LookPieceAdmin(admin.ModelAdmin):
+    list_display = ("look", "role", "product", "fallback_name", "fallback_price_fcfa", "order")
+    list_filter = ("role", "look")
+    search_fields = ("look__code", "look__title", "product__name", "fallback_name")
+    autocomplete_fields = ["product", "look"]
+
