@@ -68,6 +68,8 @@ class ProductSchema(BaseModel):
     is_active: bool
     in_stock: bool
     total_stock: int
+    average_rating: float = 0.0
+    review_count: int = 0
     primary_image: str
     secondary_image: str
     images: List[ProductImageSchema]
@@ -121,6 +123,9 @@ class OrderCreateSchema(BaseModel):
     city: str = "Abidjan"
     commune: str = "Cocody"
     address_details: str = Field(..., min_length=3)
+    landmark: str = ""
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
     payment_method: str = "WAVE"
     payment_reference: str = ""
     notes: str = ""
@@ -155,6 +160,9 @@ class OrderOutSchema(BaseModel):
     city: str
     commune: str
     address_details: str
+    landmark: str = ""
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
     payment_method: str
     payment_reference: str
     payment_status: str
@@ -163,8 +171,60 @@ class OrderOutSchema(BaseModel):
     shipping_fee_fcfa: int
     total_fcfa: int
     notes: str
+    delivered_at: Optional[datetime] = None
     created_at: datetime
     items: List[OrderItemOutSchema]
+
+
+# --- NOTES & AVIS CLIENTS (MODÉRATION ADMIN & DÉLAI 30 JOURS) ---
+class ReviewCreateSchema(BaseModel):
+    order_item_id: int
+    rating: int = Field(..., ge=1, le=5)
+    title: str = Field(default="", max_length=140)
+    comment: str = Field(..., min_length=5, max_length=1500)
+
+
+class ReviewOutSchema(BaseModel):
+    id: int
+    product_id: int
+    product_name: str
+    product_slug: str
+    product_image: str
+    order_number: str
+    author_name: str
+    author_email: str = ""
+    rating: int
+    title: str
+    comment: str
+    status: str
+    moderation_note: str = ""
+    moderated_by_email: str = ""
+    moderated_at: Optional[datetime] = None
+    created_at: datetime
+
+
+class EligibleReviewItemSchema(BaseModel):
+    order_item_id: int
+    order_number: str
+    size: str
+    color_name: str
+    delivered_at: datetime
+    days_remaining: int
+
+
+class ProductReviewsSummarySchema(BaseModel):
+    average_rating: float
+    review_count: int
+    distribution: dict
+    reviews: List[ReviewOutSchema]
+    can_review: bool
+    eligible_items: List[EligibleReviewItemSchema]
+    my_reviews: List[ReviewOutSchema]
+
+
+class AdminReviewModerateSchema(BaseModel):
+    status: str = Field(..., pattern=r"^(APPROVED|REJECTED|PENDING)$")
+    moderation_note: str = Field(default="", max_length=255)
 
 
 # --- ADMIN CRUD SCHEMAS ---

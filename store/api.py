@@ -1,12 +1,21 @@
 import uuid
-from typing import List, Optional
+from datetime import timedelta
+from typing import Dict, List, Optional, Tuple
 from asgiref.sync import sync_to_async
 from django.db import transaction
-from django.db.models import Q
+from django.db.models import Avg, Count, Q
+from django.utils import timezone
 from django.utils.text import slugify
 from ninja import Router
 from ninja.errors import HttpError
-from accounts.auth_helpers import AsyncAdminAuthBearer, AsyncAuthBearer, decode_token
+from accounts.auth_helpers import (
+    AsyncAdminAuthBearer,
+    AsyncAuthBearer,
+    create_notification,
+    decode_token,
+    record_audit,
+    require_permission,
+)
 from django.contrib.auth import get_user_model
 from .models import (
     Collection,
@@ -15,6 +24,7 @@ from .models import (
     PaymentMethodConfig,
     Product,
     ProductImage,
+    ProductReview,
     ProductVariant,
     SiteContent,
     Look,
@@ -26,6 +36,7 @@ from .schemas import (
     AdminOrderStatusPatchSchema,
     AdminPaymentToggleSchema,
     AdminProductWriteSchema,
+    AdminReviewModerateSchema,
     AdminSiteContentPatchSchema,
     AdminVariantStockPatchSchema,
     CollectionDetailSchema,
@@ -34,7 +45,10 @@ from .schemas import (
     OrderCreateSchema,
     OrderOutSchema,
     PaymentMethodConfigSchema,
+    ProductReviewsSummarySchema,
     ProductSchema,
+    ReviewCreateSchema,
+    ReviewOutSchema,
     SiteContentSchema,
 )
 
@@ -42,12 +56,50 @@ User = get_user_model()
 router = Router(tags=["ESTLE Storefront & Admin API"])
 
 
-async def _serialize_product(p: Product) -> dict:
-    images = [img async for img in ProductImage.objects.filter(product_id=p.id).order_by("display_order", "id")]
-    variants = [v async for v in ProductVariant.objects.filter(product_id=p.id).order_by("id")]
+async def _get_rating_stats_map(product_ids: List[int]) -> Dict[int, Tuple[float, int]]:
+    if not product_ids:
+        return {}
+
+    def _query():
+        rows = (
+            ProductReview.objects.filter(
+                product_id__in=product_ids,
+                status=ProductReview.StatusChoices.APPROVED,
+            )
+            .values("product_id")
+            .annotate(avg=Avg("rating"), cnt=Count("id"))
+        )
+        return {
+            r["product_id"]: (round(float(r["avg"] or 0.0), 1), int(r["cnt"] or 0))
+            for r in rows
+        }
+
+    return await sync_to_async(_query)()
+
+
+async def _serialize_product(
+    p: Product,
+    rating_map: Optional[Dict[int, Tuple[float, int]]] = None,
+) -> dict:
+    prefetched = getattr(p, "_prefetched_objects_cache", {})
+    if "images" in prefetched:
+        images = sorted(list(prefetched["images"]), key=lambda img: (img.display_order, img.id))
+    else:
+        images = [img async for img in ProductImage.objects.filter(product_id=p.id).order_by("display_order", "id")]
+
+    if "variants" in prefetched:
+        variants = sorted(list(prefetched["variants"]), key=lambda v: v.id)
+    else:
+        variants = [v async for v in ProductVariant.objects.filter(product_id=p.id).order_by("id")]
 
     total_stock = 0 if p.is_out_of_stock_override else sum(v.stock for v in variants)
     in_stock = (not p.is_out_of_stock_override) and (total_stock > 0)
+
+    if rating_map is not None:
+        avg_rating, rev_count = rating_map.get(p.id, (0.0, 0))
+    else:
+        single_map = await _get_rating_stats_map([p.id])
+        avg_rating, rev_count = single_map.get(p.id, (0.0, 0))
 
     default_img = "https://images.unsplash.com/photo-1509631179647-0177331693ae?w=1200&auto=format&fit=crop&q=80"
     primary_image = images[0].image_url if len(images) > 0 else default_img
@@ -76,6 +128,8 @@ async def _serialize_product(p: Product) -> dict:
         "is_active": p.is_active,
         "in_stock": in_stock,
         "total_stock": total_stock,
+        "average_rating": avg_rating,
+        "review_count": rev_count,
         "primary_image": primary_image,
         "secondary_image": secondary_image,
         "images": images,
@@ -106,6 +160,9 @@ async def _serialize_order(order: Order) -> dict:
         "city": order.city,
         "commune": order.commune,
         "address_details": order.address_details,
+        "landmark": order.landmark,
+        "latitude": order.latitude,
+        "longitude": order.longitude,
         "payment_method": order.payment_method,
         "payment_reference": order.payment_reference,
         "payment_status": order.payment_status,
@@ -114,13 +171,19 @@ async def _serialize_order(order: Order) -> dict:
         "shipping_fee_fcfa": order.shipping_fee_fcfa,
         "total_fcfa": order.total_fcfa,
         "notes": order.notes,
+        "delivered_at": order.delivered_at,
         "created_at": order.created_at,
         "items": items,
     }
 
 
 async def _serialize_look(look: Look, index: int) -> dict:
-    pieces_qs = LookPiece.objects.filter(look_id=look.id).select_related("product", "product__collection").order_by("order", "id")
+    pieces_qs = (
+        LookPiece.objects.filter(look_id=look.id)
+        .select_related("product", "product__collection")
+        .prefetch_related("product__images", "product__variants")
+        .order_by("order", "id")
+    )
     pieces_data = []
     async for p in pieces_qs:
         prod = p.product
@@ -183,7 +246,7 @@ async def list_products(
     new_arrivals: Optional[bool] = None,
     search: Optional[str] = None,
 ):
-    qs = Product.objects.filter(is_active=True).select_related("collection")
+    qs = Product.objects.filter(is_active=True).select_related("collection").prefetch_related("images", "variants")
 
     if category and category.upper() != "ALL":
         qs = qs.filter(category=category.upper())
@@ -207,9 +270,11 @@ async def list_products(
     if color and color.upper() != "ALL":
         qs = qs.filter(variants__color_name__icontains=color).distinct()
 
+    products = [p async for p in qs]
+    rating_map = await _get_rating_stats_map([p.id for p in products])
     results = []
-    async for p in qs:
-        results.append(await _serialize_product(p))
+    for p in products:
+        results.append(await _serialize_product(p, rating_map=rating_map))
     return results
 
 
@@ -254,7 +319,7 @@ async def get_collection_detail(request, slug: str):
         raise HttpError(404, "Collection introuvable.")
 
     products = []
-    async for p in Product.objects.filter(collection_id=c.id, is_active=True).select_related("collection"):
+    async for p in Product.objects.filter(collection_id=c.id, is_active=True).select_related("collection").prefetch_related("images", "variants"):
         products.append(await _serialize_product(p))
 
     return {
@@ -372,6 +437,9 @@ def _execute_atomic_order(data: OrderCreateSchema, user_id: Optional[int]) -> Or
             city=data.city,
             commune=data.commune,
             address_details=data.address_details,
+            landmark=data.landmark,
+            latitude=data.latitude,
+            longitude=data.longitude,
             payment_method=pm.code,
             payment_reference=data.payment_reference or f"{pm.code}-{uuid.uuid4().hex[:6].upper()}",
             payment_status=Order.PaymentStatusChoices.PAID,
@@ -402,6 +470,24 @@ async def create_order(request, data: OrderCreateSchema):
             user_id = payload.get("user_id")
 
     order = await sync_to_async(_execute_atomic_order, thread_sensitive=True)(data, user_id)
+
+    await create_notification(
+        audience="ADMIN",
+        required_permission="orders.view",
+        category="ORDER",
+        title=f"Nouvelle commande #{order.order_number}",
+        message=f"{order.full_name} — {order.total_fcfa:,} FCFA ({order.commune}, {order.city}).".replace(",", " "),
+        link="/admin/orders",
+    )
+    if user_id:
+        await create_notification(
+            audience="CLIENT",
+            recipient_id=user_id,
+            category="ORDER",
+            title=f"Commande #{order.order_number} confirmée",
+            message=f"Votre commande de {order.total_fcfa:,} FCFA est confirmée et en préparation à Abidjan.".replace(",", " "),
+            link="/account?section=orders",
+        )
     return 201, await _serialize_order(order)
 
 
@@ -666,15 +752,43 @@ async def admin_list_orders(request):
 
 @router.patch("/admin/orders/{order_id}/status", response=OrderOutSchema, auth=AsyncAdminAuthBearer())
 async def admin_update_order_status(request, order_id: int, data: AdminOrderStatusPatchSchema):
+    require_permission(request.auth, "orders.manage")
     try:
         o = await Order.objects.aget(id=order_id)
     except Order.DoesNotExist:
         raise HttpError(404, "Commande introuvable.")
 
+    prev_status = o.status
     o.status = data.status
     if data.payment_status:
         o.payment_status = data.payment_status
+    if data.status == Order.StatusChoices.DELIVERED and not o.delivered_at:
+        o.delivered_at = timezone.now()
     await o.asave()
+
+    if o.user_id and prev_status != data.status:
+        status_messages = {
+            "CONFIRMED": ("Commande confirmée", f"Votre commande #{o.order_number} est confirmée par l'atelier ESTLE."),
+            "SHIPPING": ("Commande en cours de livraison", f"Votre coursier ESTLE est en route pour la commande #{o.order_number}."),
+            "DELIVERED": (
+                "Commande livrée — Donnez votre avis",
+                f"Votre commande #{o.order_number} a été livrée ! Vous disposez de 30 jours pour noter chaque article individuellement.",
+            ),
+            "CANCELLED": ("Commande annulée", f"Votre commande #{o.order_number} a été annulée."),
+        }
+        title, msg = status_messages.get(
+            data.status,
+            (f"Statut commande #{o.order_number}", f"Nouveau statut : {data.status}"),
+        )
+        await create_notification(
+            audience="CLIENT",
+            recipient_id=o.user_id,
+            category="ORDER",
+            title=title,
+            message=msg,
+            link="/account?section=orders",
+        )
+
     return await _serialize_order(o)
 
 
@@ -817,4 +931,295 @@ async def delete_look(request, look_id: int):
         return {"success": True, "message": "Look supprimé avec succès"}
 
     return await _delete()
+
+
+# ============================================================================
+# 6. NOTES & AVIS CLIENTS (DÉLAI 30 JOURS POST-LIVRAISON + MODÉRATION ADMIN)
+# ============================================================================
+
+def _serialize_review(r: ProductReview, include_email: bool = False) -> dict:
+    author_name = f"{r.user.first_name} {r.user.last_name}".strip() or r.user.email.split("@")[0]
+    first_img = ""
+    prefetched = getattr(r.product, "_prefetched_objects_cache", {})
+    if "images" in prefetched and prefetched["images"]:
+        first_img = prefetched["images"][0].image_url
+    else:
+        img_obj = r.product.images.first()
+        first_img = img_obj.image_url if img_obj else ""
+
+    return {
+        "id": r.id,
+        "product_id": r.product_id,
+        "product_name": r.product.name,
+        "product_slug": r.product.slug,
+        "product_image": first_img,
+        "order_number": r.order.order_number,
+        "author_name": author_name,
+        "author_email": r.user.email if include_email else "",
+        "rating": r.rating,
+        "title": r.title,
+        "comment": r.comment,
+        "status": r.status,
+        "moderation_note": r.moderation_note,
+        "moderated_by_email": r.moderated_by.email if r.moderated_by else "",
+        "moderated_at": r.moderated_at,
+        "created_at": r.created_at,
+    }
+
+
+@router.get("/products/{slug}/reviews", response=ProductReviewsSummarySchema)
+async def get_product_reviews(request, slug: str):
+    try:
+        product = await Product.objects.aget(slug=slug, is_active=True)
+    except Product.DoesNotExist:
+        raise HttpError(404, "Article introuvable.")
+
+    user_id = None
+    user_email = ""
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header.split(" ", 1)[1].strip()
+        payload = decode_token(token)
+        if payload and payload.get("token_type") == "access":
+            user_id = payload.get("user_id")
+            try:
+                u = await User.objects.aget(id=user_id, is_active=True)
+                user_email = u.email
+            except User.DoesNotExist:
+                user_id = None
+
+    def _fetch():
+        approved_qs = (
+            ProductReview.objects.filter(
+                product_id=product.id,
+                status=ProductReview.StatusChoices.APPROVED,
+            )
+            .select_related("user", "order", "product", "moderated_by")
+            .prefetch_related("product__images")
+            .order_by("-created_at")
+        )
+        approved_list = list(approved_qs)
+        review_count = len(approved_list)
+        avg_rating = (
+            round(sum(r.rating for r in approved_list) / review_count, 1)
+            if review_count > 0
+            else 0.0
+        )
+        dist = {"5": 0, "4": 0, "3": 0, "2": 0, "1": 0}
+        for r in approved_list:
+            k = str(r.rating)
+            if k in dist:
+                dist[k] += 1
+
+        eligible_items = []
+        my_reviews = []
+        if user_id:
+            my_rev_qs = (
+                ProductReview.objects.filter(product_id=product.id, user_id=user_id)
+                .select_related("user", "order", "product", "moderated_by")
+                .prefetch_related("product__images")
+                .order_by("-created_at")
+            )
+            my_reviews = [_serialize_review(r, include_email=False) for r in my_rev_qs]
+
+            now = timezone.now()
+            order_items = (
+                OrderItem.objects.filter(
+                    product_id=product.id,
+                    order__status=Order.StatusChoices.DELIVERED,
+                )
+                .filter(Q(order__user_id=user_id) | Q(order__email__iexact=user_email))
+                .select_related("order")
+                .order_by("-order__delivered_at", "-order__updated_at")
+            )
+            reviewed_item_ids = set(
+                ProductReview.objects.filter(
+                    product_id=product.id, user_id=user_id
+                ).values_list("order_item_id", flat=True)
+            )
+            for oi in order_items:
+                if oi.id in reviewed_item_ids:
+                    continue
+                delivered_ts = oi.order.delivered_at or oi.order.updated_at or oi.order.created_at
+                deadline = delivered_ts + timedelta(days=30)
+                if now <= deadline:
+                    days_left = max(1, (deadline - now).days + 1)
+                    eligible_items.append(
+                        {
+                            "order_item_id": oi.id,
+                            "order_number": oi.order.order_number,
+                            "size": oi.size,
+                            "color_name": oi.color_name,
+                            "delivered_at": delivered_ts,
+                            "days_remaining": min(30, days_left),
+                        }
+                    )
+
+        return {
+            "average_rating": avg_rating,
+            "review_count": review_count,
+            "distribution": dist,
+            "reviews": [_serialize_review(r, include_email=False) for r in approved_list],
+            "can_review": len(eligible_items) > 0,
+            "eligible_items": eligible_items,
+            "my_reviews": my_reviews,
+        }
+
+    return await sync_to_async(_fetch)()
+
+
+@router.post("/products/{slug}/reviews", response={201: ReviewOutSchema}, auth=AsyncAuthBearer())
+async def create_product_review(request, slug: str, data: ReviewCreateSchema):
+    user = request.auth
+    try:
+        product = await Product.objects.aget(slug=slug, is_active=True)
+    except Product.DoesNotExist:
+        raise HttpError(404, "Article introuvable.")
+
+    def _create():
+        try:
+            oi = (
+                OrderItem.objects.select_related("order")
+                .filter(Q(order__user_id=user.id) | Q(order__email__iexact=user.email))
+                .get(id=data.order_item_id, product_id=product.id)
+            )
+        except OrderItem.DoesNotExist:
+            raise HttpError(
+                403,
+                "Vous ne pouvez noter cet article que si vous l'avez commandé et reçu.",
+            )
+
+        if oi.order.status != Order.StatusChoices.DELIVERED:
+            raise HttpError(
+                400,
+                "Vous pourrez noter cet article dès que votre commande aura été livrée.",
+            )
+
+        delivered_ts = oi.order.delivered_at or oi.order.updated_at or oi.order.created_at
+        if timezone.now() > delivered_ts + timedelta(days=30):
+            raise HttpError(
+                400,
+                "Le délai de 30 jours après livraison pour noter cet article est expiré.",
+            )
+
+        if ProductReview.objects.filter(order_item_id=oi.id).exists():
+            raise HttpError(400, "Vous avez déjà soumis une note pour cet article.")
+
+        rev = ProductReview.objects.create(
+            product=product,
+            user=user,
+            order=oi.order,
+            order_item=oi,
+            rating=data.rating,
+            title=data.title.strip(),
+            comment=data.comment.strip(),
+            status=ProductReview.StatusChoices.PENDING,
+        )
+        rev = (
+            ProductReview.objects.select_related("user", "order", "product", "moderated_by")
+            .prefetch_related("product__images")
+            .get(id=rev.id)
+        )
+        return _serialize_review(rev, include_email=False)
+
+    created_data = await sync_to_async(_create)()
+
+    await create_notification(
+        audience="ADMIN",
+        required_permission="reviews.manage",
+        category="REVIEW",
+        title=f"Nouvel avis à valider ({data.rating}★) — {product.name}",
+        message=f"{created_data['author_name']} a laissé un avis sur {product.name} (Commande #{created_data['order_number']}).",
+        link="/admin/reviews",
+    )
+
+    return 201, created_data
+
+
+@router.get("/admin/reviews", response=List[ReviewOutSchema], auth=AsyncAdminAuthBearer())
+async def admin_list_reviews(request, status: Optional[str] = None):
+    require_permission(request.auth, "reviews.manage")
+
+    def _fetch():
+        qs = (
+            ProductReview.objects.select_related("user", "order", "product", "moderated_by")
+            .prefetch_related("product__images")
+            .order_by("-created_at")
+        )
+        if status and status.upper() in ("PENDING", "APPROVED", "REJECTED"):
+            qs = qs.filter(status=status.upper())
+        return [_serialize_review(r, include_email=True) for r in qs]
+
+    return await sync_to_async(_fetch)()
+
+
+@router.patch("/admin/reviews/{review_id}", response=ReviewOutSchema, auth=AsyncAdminAuthBearer())
+async def admin_moderate_review(request, review_id: int, data: AdminReviewModerateSchema):
+    require_permission(request.auth, "reviews.manage")
+
+    def _moderate():
+        try:
+            rev = (
+                ProductReview.objects.select_related("user", "order", "product", "moderated_by")
+                .prefetch_related("product__images")
+                .get(id=review_id)
+            )
+        except ProductReview.DoesNotExist:
+            raise HttpError(404, "Avis introuvable.")
+
+        rev.status = data.status
+        rev.moderation_note = data.moderation_note.strip()
+        rev.moderated_by = request.auth
+        rev.moderated_at = timezone.now()
+        rev.save()
+        return rev, _serialize_review(rev, include_email=True)
+
+    rev, serialized = await sync_to_async(_moderate)()
+
+    await record_audit(
+        request.auth,
+        "REVIEW_MODERATED",
+        f"Avis #{rev.id} ({rev.rating}★ sur {rev.product.name}) → {rev.status}",
+        "ProductReview",
+        str(rev.id),
+    )
+
+    if rev.status == ProductReview.StatusChoices.APPROVED:
+        await create_notification(
+            audience="CLIENT",
+            recipient_id=rev.user_id,
+            category="REVIEW",
+            title=f"Votre avis sur {rev.product.name} est publié !",
+            message=f"Merci pour votre note de {rev.rating}★. Votre avis a été validé par notre équipe et est désormais visible.",
+            link=f"/product/{rev.product.slug}#reviews",
+        )
+    elif rev.status == ProductReview.StatusChoices.REJECTED:
+        note_suffix = f" Motif : {rev.moderation_note}" if rev.moderation_note else ""
+        await create_notification(
+            audience="CLIENT",
+            recipient_id=rev.user_id,
+            category="REVIEW",
+            title=f"Votre avis sur {rev.product.name} n'a pas été retenu",
+            message=f"Votre avis soumis pour {rev.product.name} n'a pas pu être publié.{note_suffix}",
+            link=f"/product/{rev.product.slug}#reviews",
+        )
+
+    return serialized
+
+
+@router.delete("/admin/reviews/{review_id}", auth=AsyncAdminAuthBearer())
+async def admin_delete_review(request, review_id: int):
+    require_permission(request.auth, "reviews.manage")
+    deleted, _ = await ProductReview.objects.filter(id=review_id).adelete()
+    if not deleted:
+        raise HttpError(404, "Avis introuvable.")
+    await record_audit(
+        request.auth,
+        "REVIEW_DELETED",
+        f"Avis #{review_id} supprimé",
+        "ProductReview",
+        str(review_id),
+    )
+    return {"ok": True}
+
 

@@ -34,6 +34,7 @@ class Product(models.Model):
         COLLECTIONS = "COLLECTIONS", "03 — COLLECTIONS"
         NEW_ARRIVALS = "NEW_ARRIVALS", "04 — NEW ARRIVALS"
         FOOTWEAR = "FOOTWEAR", "05 — FOOTWEAR"
+        ACCESSORIES = "ACCESSORIES", "06 — ACCESSORIES"
 
     collection = models.ForeignKey(
         Collection,
@@ -178,6 +179,9 @@ class Order(models.Model):
     city = models.CharField(max_length=100, default="Abidjan")
     commune = models.CharField(max_length=100, default="Cocody")
     address_details = models.CharField(max_length=255)
+    landmark = models.CharField(max_length=255, blank=True)
+    latitude = models.FloatField(null=True, blank=True)
+    longitude = models.FloatField(null=True, blank=True)
     payment_method = models.CharField(max_length=30, default="WAVE")
     payment_reference = models.CharField(max_length=120, blank=True)
     payment_status = models.CharField(
@@ -195,6 +199,7 @@ class Order(models.Model):
     shipping_fee_fcfa = models.PositiveIntegerField(default=2000)
     total_fcfa = models.PositiveIntegerField(default=0)
     notes = models.TextField(blank=True)
+    delivered_at = models.DateTimeField(null=True, blank=True, db_index=True)
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -285,4 +290,62 @@ class LookPiece(models.Model):
     def __str__(self):
         name = self.product.name if self.product else self.fallback_name
         return f"[{self.role}] {name} ({self.look.code})"
+
+
+class ProductReview(models.Model):
+    class StatusChoices(models.TextChoices):
+        PENDING = "PENDING", "En attente de validation"
+        APPROVED = "APPROVED", "Validé & Publié"
+        REJECTED = "REJECTED", "Refusé"
+
+    product = models.ForeignKey(
+        Product,
+        related_name="reviews",
+        on_delete=models.CASCADE,
+        db_index=True,
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        related_name="product_reviews",
+        on_delete=models.CASCADE,
+        db_index=True,
+    )
+    order = models.ForeignKey(
+        Order,
+        related_name="reviews",
+        on_delete=models.CASCADE,
+    )
+    order_item = models.OneToOneField(
+        OrderItem,
+        related_name="review",
+        on_delete=models.CASCADE,
+    )
+    rating = models.PositiveSmallIntegerField()  # 1 à 5 étoiles
+    title = models.CharField(max_length=140, blank=True)
+    comment = models.TextField()
+    status = models.CharField(
+        max_length=20,
+        choices=StatusChoices.choices,
+        default=StatusChoices.PENDING,
+        db_index=True,
+    )
+    moderated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="moderated_reviews",
+    )
+    moderation_note = models.CharField(max_length=255, blank=True)
+    moderated_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Avis Client"
+        verbose_name_plural = "Avis Clients"
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.product.name} — {self.rating}★ ({self.status})"
 
